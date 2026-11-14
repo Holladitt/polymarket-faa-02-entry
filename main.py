@@ -1,147 +1,52 @@
-# FAA PORT — V10 mechanism, ported verbatim from polymarket-nvidia-entry/main.py
-# (NVIDIA V10, submitted 14 Nov ~02:30 WIB, practice 0.199545).
-# This competition (polymarket-faa-attribution-02) runs the SAME protocol
-# (agent-fun/program/v1, main.py, stdlib only, offline, deterministic,
-# <=8000 ms/case, /output/<id>.out) and the SAME six practice cases
-# (NVIDIA history, p00-p05). The final is different: 12 cases h00-h11 over
-# the 4 markets of Polymarket's FAA outage attribution family, 240 minutes
-# each. The code is generic in the number of markets (it reads
-# case["markets"] and case["horizon_minutes"]); nothing about the mechanism
-# depends on the event or the market count, so the port changes only the
-# header/docstring event references, never the mechanism or parameters.
-# V10 summary (see NVIDIA NOTES.md Round 10): v9 base (0.202403) + Box
-# track: k_up 0.38, zb_w 1.5, xfan_w 0.65. Mean 0.199545, calm 0.120819,
-# wins 6/6 vs V9, LOCO 6/6 folds (Box). Deterministic, stdlib-only, offline.
 #!/usr/bin/env python3
-"""Polymarket minute-by-minute Yes-price quantile forecaster.
-
-Reads one case at a time from $MAKEFUN_INPUT_DIR (else /input): the event's
-trading markets' Yes prices on a 1-minute grid up to a checkpoint. Writes
-$MAKEFUN_OUTPUT_DIR/<id>.out (else /output/<id>.out): for each market and each
-of the 240 minutes after the checkpoint, five quantiles (5/25/50/75/95%) of
-that minute's price.
-
-Method (all parameters are fixed constants below; nothing is fitted at run
-time beyond what the case's own prices imply). Evidence from the practice
-history (EDA on the six practice cases, answers rebuilt from Polymarket's
-public CLOB history):
-  * Median: last price, pulled toward its board-sum-normalised share
-    (the markets' Yes prices sum to ~1; a market's fair share is x / sum(x) --
-    the 240-minute move regresses on the sum gap with slope ~0.55), with
-    the board-sum adjustment shared across markets in proportion to
-    x_i * sigma_i (liquid markets absorb more of the gap; the old x_i-only
-    sharing scored 0.2517 vs 0.2512 for this one, and is better on the
-    calm cases too), plus give-back of recent run-ups: after a 1-minute
-    rise >= 0.02 the price gives back ~2/3 within 15 minutes and ~3/4
-    within an hour, while after a fall of the same size it gives back
-    almost nothing -- so the give-back is strongly asymmetric (rises
-    revert, falls persist).
-    Momentum extrapolation and pull toward a slow EMA both HURT badly
-    (tested: momentum k=0.2 already costs +0.016 loss), so neither is used.
-  * v3 changes (round 2, practice 0.2512 -> 0.2441; top-10 bar 0.237 NOT
-    reached -- see NOTES.md for the full rejected list):
-    - ASYMMETRIC sum-pull: when the board is UNDER-priced (sum < 1) the
-      pull is scaled by k_up = 0.5 (the gap closes only ~half as much
-      upward as the symmetric model assumes); when OVER-priced (sum > 1)
-      it is scaled by k_down = 1.4 (down-gaps close almost fully).
-    - GAP TREND (momentum, not mean-reversion): the pull uses the gap
-      EXTRAPOLATED by its last-60-min change (gap - c_trend*(gap-gap60),
-      c_trend = -0.2). Reversing the trend instead (c > 0) costs +0.015.
-    - PULL TILT across quantiles: the pull displacement is scaled by
-      (1 - kappa*z), kappa = 0.15, so the lower tail moves more with the
-      pull than the upper tail (gap closure arrives as downward jumps).
-    - GIVE-BACK softened to gb_up = 0.35 (0.45 over-gives-back on drifts;
-      the history OLS slope is only ~0.17 and the robust median is 0).
-    - DEADBAND + fan compression: when a row's median displacement from
-      the last price is < 0.001 the median is set to the last price
-      exactly (57% of 240-min moves are exactly zero, so small drifts are
-      pure MAE drag) and the fan around it is compressed x0.85 (a market
-      that is not moving has a narrower forward distribution).
-  * v4 changes (round 4, practice 0.2441 -> 0.236538; top-10 bar 0.237
-    REACHED; calm p04/p05 mean 0.1331 -> 0.130397 — see NOTES.md):
-    REGIME SCALING. The board's mean EWMA sigma V at the checkpoint
-    measures the volatility regime (launch V ~0.0035-0.0036, calm
-    V ~0.0013-0.0020; practice median Vmed = 0.002696). Pull strength is
-    scaled by (1 + 1.7*(V-Vmed)/Vmed), clipped to [0.3, 2.5], and sigma
-    by (V/Vmed)^0.5, clipped to [0.5, 2.0]: launch regimes pull harder
-    with a wider fan, calm regimes pull softer with a narrower fan.
-    Also k_down 1.4 -> 1.61, k_up 0.5 -> 0.425, cap 0.012 -> 0.0102,
-    pull_tau 120 -> 111, outer tail widens x(1 + 0.1*h/240).
-  * v5 changes (round 5, practice 0.236538 -> 0.226575; top-10 bar ~0.231;
-    calm p04/p05 mean 0.130397 -> 0.129256 — see NOTES.md):
-    - REGIME-GATED TWO-TIMESCALE PULL: pull(h) gains a fast component
-      (tau 10 min) gated by regime, w_f_eff = 1.0*clip(2.0*(rscale-1),0,1),
-      so only volatile/launch regimes pull fast; calm cases keep v4's
-      slow pull exactly (calm score unchanged by this mechanism alone).
-      EDA: the true pull response is fast early (OLS slope 0.27 at h<=15)
-      while v4's single exp(-h/111) gives only 0.06 there.
-    - REGIME-GATED LINEAR SHARE TARGET: in volatile regimes the pull
-      converges to the pure board-sum-normalised share (adj = x/sum - x)
-      instead of the x*sigma-weighted gap share; blended by regime,
-      g = clip(2.0*(rscale-1),0,1). v4's weighted allocation misallocates
-      the gap when sigma varies wildly across markets (launch). p00
-      improves 0.3486 -> 0.2884; other cases neutral-to-better.
-    - EMPIRICAL-Z FAN BLEND (0.25): Gaussian z blended toward the pooled
-      empirical quantiles of (y-med)/sigma(h) by horizon bucket; the
-      residual distribution is narrower and asymmetric vs Gaussian
-      (q25 -0.24 vs -0.674, q75 +0.06 vs +0.674; q95 grows with h).
-    - k_down 1.61 -> 1.9, k_up 0.425 -> 0.3.
-    Rejected in round 5: vol-trend fan scaling, v_mode median/recent,
-    regime-scaled give-back, two-timescale give-back (helps calm only),
-    z_lo/z_hi asymmetry, per-market tick deadband (marginal), staleness
-    weights >0.5, target logit (similar to linear, slightly worse).
-  * v6 changes (round 6, CONSERVATIVE version, practice 0.222954 -> 0.222196;
-    calm 0.128383 -> 0.127977). Only three surgical changes on top of v5,
-    each with its own out-of-sample evidence; everything else is v5 exactly:
-    - rscale floor 0.3 -> 0.6 (sweep 0.45-1.0, optimum ~0.6; nested LOCO:
-      train-best lo=0.6 in 5/6 folds, held-out p05 improves).
-    - Z-table + h=240 row ([-1.96, -0.483, 0, 0.387, 3.405] from v5
-      residuals): tails keep growing with h; old table clamped h>180.
-      Ablation: removing it costs +0.00035 mean, v6 wins 6/6.
-    - trend_win 60 -> 30 (Box LOCO + local sweep 15-90, plateau 25-30):
-      gain -0.00046 mean, driven by p01 (-0.0028).
-    REJECTED for submission (in-sample only, see NOTES.md): the full
-    30-param coordinate-descent polish (0.220954 in-sample). Nested LOCO
-    refit: 0.228065 held-out vs v5 0.222763 — the polish overfits and would
-    likely score WORSE than v5 on unseen cases. Same verdict independently
-    from the Box lane (CD 0.221405 -> LOCO 0.233003).
-  * v8 Track A changes (round 8, practice 0.220199 -> 0.214552; calm UNCHANGED
-    0.128007 — see NOTES.md Round 8 Track A). ONE new mechanism on top of v7:
-    LAST-MOVE (d1) DISPLACEMENT, regime-gated. EDA (joint OLS of y_h-x on
-    adj, d1, r60 per horizon bucket, pooled 6 cases): the last 1-minute move
-    d1 CONTINUES at short horizon (slope +0.39 at h<=8, +0.69 at h9-30) then
-    REVERTS at long horizon (-0.37 at h31-90, -0.52 at h91-180, -0.86 at
-    h181-240); r60 slope ~0 (give-back already captures it). The median of
-    every quantile row is shifted by B(h)*d1*g, B(h) linearly interpolated
-    between bucket centres (4.5, 19.5, 60.5, 135.5, 210.5), g =
-    clip(d1_gate_k*(rscale-1),0,1) so calm cases (rscale<=1) are EXACTLY
-    untouched. This is NOT momentum extrapolation (rejected rounds 1-7):
-    that was a same-sign drift on the 60-min run-up; this is a two-phase
-    d1 response whose long-horizon leg is reversion, and it is gated off
-    in calm regimes. The full linear-median replacement (adj+d1+r60 OLS
-    median instead of v7 pull) was tried and REJECTED (0.2352, calm 0.158);
-    the additive-on-v7 form is what works. Centre alternatives (median /
-    mean / EWMA of last K prices) all LOSE to the last price at every
-    horizon and were rejected; gap smoothing adds nothing (corr flat).
-  * Spread: per-market realised volatility as a blend of a fast and a slow
-    EWMA of squared 1-minute changes (winsorised), with a price-level
-    floor; the per-minute spread grows with horizon but saturates hard
-    (the SD of h-step changes grows like h^0.33, not sqrt(h)), and the
-    outer quantiles are widened for fat tails. A direct empirical
-    h-step-quantile fan was tried and was much worse (0.313): the move
-    distribution is a point mass at zero with rare jumps, so raw empirical
-    quantiles collapse.
-  * Everything is clipped to [0, 1], rows are non-decreasing, output is
-    deterministic (no randomness, no network, stdlib only). A market with
-    no prices at all is forecast flat at 0.5 rather than crashing the run:
-    one bad market must never invalidate the whole case.
-"""
+# R7 G1 — H5b + board-gated pull (TARGET: dev top-10 TANPA mengorbankan final).
+# Basis: H5b (challengers/h5b_softreset.py; practice 0.249808, FAA 1.715232),
+# verbatim kecuali delta R7 di bawah.
+# R7 DELTA: (1) pull board-sum di-GATE pada bentuk board: pull_max =
+# V10_PULL_MAX (0.931198) bila n_markets >= 10 DAN board_sum > 0.5,
+# selain itu pull_max = 0.0. (2) Konstanta V10_PULL_MAX + global
+# _LAST_BOARD_GATE; main() log gate per case ke stderr.
+# Alasan: pull board-sum SAH hanya bila board-nya partisi (harga jumlah 1).
+# Board practice NVIDIA (19-24 market, sum 0.81-1.09) partisi; board FAA
+# (2-4 market tumpang tindih, sum 0.22-0.30) bukan. Gate mengunci pada
+# BENTUK board, bukan nama kompetisi — jadi pull tetap MATI di 12 case
+# final FAA (4 market). Terverifikasi: gate=1 di semua 6 practice case,
+# gate=0 di semua 4 case backtest FAA (cek independen dari JSON case).
+# R6 H5b — News-reset SOFTER (fix of R5-H5): drift HALVED (0.5x), not killed,
+# after a >=0.03/60min drop below 0.08 (give-back, d1 and gmom all scaled
+# 0.5 for reset markets). H5: practice 0.250966 / FAA 1.705468.
+# H5 — News-reset persistence (R2-M3) untuk polymarket-faa-attribution-02.
+# Basis: F4 (finalists/f4_pulloff_proj.py), verbatim kecuali delta di bawah.
+# DELTA: (1) PARAMS "news_reset": 1; (2) setelah penurunan 60 menit >= 0.03
+# yang membawa harga di bawah 0.08, median = harga terakhir untuk SEMUA
+# horizon dan SEMUA drift mati (give-back di forecast_market, d1, gmom —
+# ketiganya di-skip untuk market yang reset). Fan tetap. Trigger dievaluasi
+# di checkpoint (forecast statis): drop60 = p_t - p_{t-60} (atau p_t - p_0
+# bila histori < 61); aktif bila drop60 <= -0.03 DAN p_t < 0.08. Kondisi
+# mati (harga >= 0.08 atau naik >= 0.03/60 mnt) hanya bermakna di sistem
+# live — di forecast statis, trigger checkpoint yang berlaku. Alasan yang
+# benar (koreksi R2): bias recovery F4 datang dari kaki long-h d1 (B(h)
+# negatif di h>=60), bukan give-back (gb_dn = 0 sudah inert setelah jatuh)
+# — M3 mematikan SEMUA drift termasuk d1.
+"""F4 + news-reset (softer): after a >=0.03/60min drop below 0.08, drift halved (0.5x)."""
 import json
 import math
 import os
+import sys
 
 QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.644854, -0.67449, 0.0, 0.67449, 1.644854]
+
+# R7: V10 pull_max (verified from polymarket-nvidia-entry/main.py PARAMS:
+# 0.931198; all other pull params in this file are bit-identical to V10's —
+# only pull_max differed, 0.0 vs 0.931198).
+V10_PULL_MAX = 0.931198
+_LAST_BOARD_GATE = 0.0  # set per case by forecast_case; logged by main().
+
+# FAA logical subset (verified vs Gamma API): attribution to Iran entails
+# attribution to a foreign actor. ConditionIds of the two markets.
+IRAN_ID = "0x9c8c0ef1a573ea1b641900c2cd9f55f084925576fde1c178410146afe348264b"
+FOREIGN_ID = "0x222f9065c3d6c069932f4f23b2f7f3efeb078a2e475bec8bb8ff15a4d776b579"
 
 PARAMS = {
     # realised volatility: EWMA half-lives (minutes) and blend weight
@@ -160,10 +65,10 @@ PARAMS = {
     # horizon-linear outer-tail widening (round 4): outer width x (1 + tail_lin*h/240)
     "tail_lin": 0.217931,
     # median: pull toward sum-normalised share, strength pull_max*(1-exp(-h/pull_tau))
-    "pull_max": 0.931198,
+    # F4 DELTA (from F2): pull_max stays 0.0 (board-sum pull DISABLED).
+    "pull_max": 0.0,
     "pull_tau": 161.241351,
-    # pull weight: w_i propto x_i * sigma_i^pull_b, so liquid markets absorb
-    # more of the board-sum adjustment (pull_b=0 is the old x_i-only weight)
+    # pull weight: w_i propto x_i * sigma_i^pull_b (pull_b=0 is x_i-only weight)
     "pull_b": 1.8,
     "pull_b_gate": 1.2,
     "pull_b_calm": 2.25,
@@ -175,14 +80,10 @@ PARAMS = {
     "stale_inner_c": 0.0,
     "stale_inner_age": 120.0,
     "k_down": 1.905285,
-    # regime scaling (round 4): the board's mean EWMA sigma V measures the
-    # volatility regime at the checkpoint; Vmed is its practice median.
-    # pull strength x (1 + regime_pull*(V-Vmed)/Vmed), clipped to [0.3, 2.5];
-    # sigma x (V/Vmed)^regime_fan, clipped to [0.5, 2.0]. In launch regimes
-    # the pull is stronger and the fan wider; in calm regimes both shrink.
-    # ROUND 6: rscale floor. The calmest case (p05, V=0.0013) clipped at the
-    # 0.3 floor and pulled too weakly; 0.6 is the validated optimum
-    # (sweep 0.45-1.0, plateau 25-30 for trend_win; nested LOCO clean).
+    # regime scaling (round 4): V = board mean EWMA sigma at the checkpoint.
+    # pull strength x (1 + regime_pull*(V-Vmed)/Vmed), clipped to [rscale_lo, 2.5];
+    # sigma x (V/Vmed)^regime_fan, clipped to [0.5, 2.0].
+    # ROUND 6: rscale floor 0.6 (validated optimum, sweep 0.45-1.0).
     "rscale_lo": 0.6,
     "regime_pull": 1.663268,
     "regime_vmed": 0.0026960411939506426,
@@ -203,37 +104,25 @@ PARAMS = {
     "db_spread": 0.9,
     # ROUND 5 (experimental): empirical standardized-quantile fan.
     # z_blend in [0,1]: 0 = pure Gaussian v4, 1 = pure empirical z-table.
-    # The z-table is the pooled empirical quantiles of (y - med)/sh(h),
-    # bucketed by horizon (centres h=8,38,90,180), interpolated linearly.
-    # z_lo / z_hi scale the lower / upper |z| magnitudes (asymmetry).
     "z_blend": 0.564716,
     "z_lo": 1.0,
     "z_hi": 1.0,
     # ROUND 5: two-timescale pull. pull(h) = pull_max*rscale*(
     #   pull_fast_w*(1-exp(-h/pull_tau_fast)) + (1-pull_fast_w)*(1-exp(-h/pull_tau))).
-    # pull_fast_w=0 reproduces v4 exactly. EDA: true pull response is fast
-    # early (slope 0.27 at h<=15) and grows to ~0.85 by h=240, while v4's
-    # single exp(-h/111) gives only 0.06 at h=8.
     "pull_fast_w": 1.0,
     "pull_tau_fast": 14.679043,
     # ROUND 5: regime-scaled give-back. gb_up_eff = gb_up*(1+gb_regime*(rscale-1)).
-    # gb_regime=0 reproduces v4.
     "gb_regime": 0.0,
     # ROUND 5: regime-gated fast pull. pull_fast_regime=1 gates the fast
-    # pull component by the regime: w_f_eff = pull_fast_w*clip(gate_k*(rscale-1),0,1),
-    # so calm cases keep v4's slow pull and only launch regimes pull fast.
+    # pull component by the regime: w_f_eff = pull_fast_w*clip(gate_k*(rscale-1),0,1).
     "pull_fast_regime": 1.0,
     "pull_fast_gate_k": 2.706696,
-    # ROUND 5: two-timescale give-back. gb(h) = gb_max*(
-    #   gb_fast_w*(1-exp(-h/gb_tau_fast)) + (1-gb_fast_w)*(1-exp(-h/gb_tau))).
+    # ROUND 5: two-timescale give-back.
     "gb_fast_w": 0.0,
     "gb_tau_fast": 15.0,
     # ROUND 5: vol-trend fan scaling. sigma1 *= (fast_sigma/slow_sigma)^e.
-    # e=0 reproduces v4. Rising vol at the checkpoint -> wider forward fan.
     "vol_trend_e": 0.0,
     # ROUND 5 (Gemini ideas): staleness-weighted pull allocation.
-    # raw_i *= stale_i^stale_w, stale_i = fraction of zero 1-min moves in
-    # the last 240 prices (0 = fresh, 1 = fully stale). stale_w=0 is v4.
     "stale_w": 0.696201,
     # ROUND 5 (Gemini ideas): pull target mode. "weighted" = v4 (gap shared
     # by x*sigma weights); "linear" = adj_i = x_i/sum - x_i (pure
@@ -241,50 +130,28 @@ PARAMS = {
     # - x_i with c solving sum(sigmoid(logit(x_j)-c)) = 1.
     # target_gate_k > 0 BLENDS the target-mode adj with the weighted adj by
     # regime: adj = (1-g)*adj_weighted + g*adj_target, g = clip(gate_k *
-    # (rscale-1), 0, 1) — calm cases keep v4, volatile cases use the target.
+    # (rscale-1), 0, 1).
     "target_mode": "linear",
     "target_gate_k": 1.925936,
-    # ROUND 7 (experimental): sigma-relative deadband. The flat db_eps judges
-    # a median displacement against an absolute price scale, but a 0.001 move
-    # is noise for a market with sigma 0.005 and signal for one with sigma
-    # 0.0005. db_mode="sigma" sets eps_i = db_eps * sigma_i / median_sigma.
+    # ROUND 7 (experimental): sigma-relative deadband.
     "db_mode": "flat",
     "db_tick_k": 1.0,
-    # ROUND 7 (experimental): size-dependent pull response. EDA (round 7):
-    # pooled pull-response slope by market size: big (x>0.1) ~0.8 with
-    # corr 0.5-0.7, mid (0.01-0.1) ~1.24-1.74 with corr 0.2-0.4, small
-    # (x<0.01) corr ~0.00 -- small markets do not respond to the board-sum
-    # gap at all (their moves are idiosyncratic/news jumps). size_mult_on=1
-    # scales each market's adj by its size bucket multiplier; 0 = v6 exactly.
+    # ROUND 7 (experimental): size-dependent pull response.
     "size_mult_on": 0,
     "size_mult_hi": 0.85,
     "size_mult_mid": 1.4,
     "size_mult_lo": 0.0,
-    # ROUND 7b: gap-sign-dependent small-market multiplier. Small markets
-    # cannot fall below 0 (floor) but can rise a lot, so their pull response
-    # should be ~0 when the gap pulls DOWN (gap<0) and normal when the gap
-    # pulls UP (gap>0). lo_up/lo_dn override size_mult_lo when set (>=0).
+    # ROUND 7b: gap-sign-dependent small-market multiplier.
     "size_mult_lo_up": -1.0,
     "size_mult_lo_dn": -1.0,
-    # ROUND 7: reallocate the gap after zeroing small markets (size_realloc=1
-    # rescales the surviving adjs so their sum is preserved).
+    # ROUND 7: reallocate the gap after zeroing small markets.
     "size_realloc": 0,
-    # ROUND 7 (experimental): young-market fan boost. EDA: markets with <60
-    # prices lose 1.21 (8x the average) with coverage_90 0.42-0.53 -- severe
-    # under-coverage, i.e. a FAN problem, not a median problem. sigma1 is
-    # multiplied by (1 + young_boost*exp(-n/young_tau)), fan only (V and
-    # pull weights keep the unboosted sigma). FINAL v7: boost 1.5, tau 50
-    # (plateau 1.0-2.0 x 50; train-best in nested LOCO 5/6 folds).
+    # ROUND 7 (experimental): young-market fan boost.
     "young_boost": 1.5,
     "young_tau": 50.0,
-    # ROUND 7 (experimental): global fan scale (EDA: per-case optimal fan
-    # multiplier 0.8-1.1, no regime pattern; gains tiny and mixed).
+    # ROUND 7 (experimental): global fan scale.
     "fan_scale": 1.0,
     # ROUND 8 Track A: last-move (d1) displacement, regime-gated.
-    # B(h) = d1 response per horizon bucket (joint OLS, see docstring);
-    # centres d1_h = [4.5, 19.5, 60.5, 135.5, 210.5], linear interp,
-    # clamped outside. g = clip(d1_gate_k*(rscale-1),0,1): calm untouched.
-    # d1_on=0 reproduces v7 exactly.
     "d1_on": 1,
     "d1_scale": 1.5,
     "d1_gate_k": 3.0,
@@ -295,35 +162,33 @@ PARAMS = {
     "gmom_tau": 30.0,
     "gmom_gate_k": 2.0,
     "gmom_mode": "dn",
-    # ROUND 7 (experimental): saturating regime scaling, rscale =
-    # 1 + regime_pull*tanh((V-Vmed)/Vmed) instead of the linear form.
+    # ROUND 7 (experimental): saturating regime scaling.
     "rscale_tanh": 0,
-    # ROUND 5: regime variable definition. "mean" = v4 (board mean sigma);
-    # "median" = board median sigma; "recent" = sigma from last 240 prices.
+    # ROUND 5: regime variable definition. "mean" = board mean sigma.
     "v_mode": "mean",
-    # ROUND 10 (Box track, NEW knobs; defaults reproduce v9 exactly):
-    # xfan_w: v9 Track D weight, was module constant XFAN_W=0.20.
+    # ROUND 10 (Box track): xfan_w: v9 Track D weight.
     "xfan_w": 0.65,
     # fan_h_lin: horizon-linear fan multiplier (1 + fan_h_lin*h/240) on sh.
     "fan_h_lin": 0.0,
     # pb_lo/pb_mid/pb_hi: per-x-bucket pull exponent overriding pb_eff
-    # (-1 = use pb_eff). Bucket edges match _xbucket/<0.01/<0.1/>=0.1.
+    # (-1 = use pb_eff).
     "pb_lo": -1.0,
     "pb_mid": -1.0,
     "pb_hi": -1.0,
     # stale_outer_c: like stale_inner_c but for q05/q95 (1.0 = off).
     "stale_outer_c": 1.0,
+    # H5b DELTA: news-reset SOFTER — drift halved (0.5x), not killed.
+    "news_reset": 1,
 }
 
 # Empirical z-table: (h_centre, [z05, z25, z50, z75, z95]) from the v4
-# residuals pooled over all six practice cases (see /tmp/poly_r5_eda.py).
+# residuals pooled over all six practice cases.
 ZTABLE = [
     (8, [-1.221, -0.070, 0.0, 0.000, 1.104]),
     (38, [-1.522, -0.242, 0.0, 0.062, 1.666]),
     (90, [-1.373, -0.289, 0.0, 0.164, 2.627]),
     (180, [-1.633, -0.485, 0.0, 0.308, 3.034]),
-    # ROUND 6: h=240 row from v5 residuals (tails keep growing with h;
-    # the old table clamped h>180 to the 180 row and understated long-h tails).
+    # ROUND 6: h=240 row from v5 residuals (tails keep growing with h).
     (240, [-1.96, -0.483, 0.0, 0.387, 3.405]),
 ]
 
@@ -381,7 +246,17 @@ def _sigma_capped(prices, P):
     return s
 
 
-def forecast_market(prices, horizon, adj, P, rscale=1.0, fscale=1.0):
+def _news_reset_active(prices):
+    """True if the 60-min drop is >= 0.03 and the last price is < 0.08."""
+    if len(prices) < 2:
+        return False
+    p = prices[-1]
+    if p >= 0.08:
+        return False
+    ref = prices[-61] if len(prices) >= 61 else prices[0]
+    return (p - ref) <= -0.03
+
+def forecast_market(prices, horizon, adj, P, rscale=1.0, fscale=1.0, reset=False):
     """One market's 240x5 quantile rows. adj is this market's share of the
     board-sum adjustment (signed price units, added to the last price).
     rscale scales the pull strength, fscale scales sigma1 (regime scaling)."""
@@ -440,7 +315,8 @@ def forecast_market(prices, horizon, adj, P, rscale=1.0, fscale=1.0):
         w_g = P.get("gb_fast_w", 0.0)
         gb = (w_g * (1.0 - math.exp(-h / P["gb_tau_fast"]))
               + (1.0 - w_g) * (1.0 - math.exp(-h / P["gb_tau"])))
-        gb_disp = gb * (gb_up_eff * up + gb_dn_eff * dn)
+        # H5 DELTA: news-reset kills the give-back drift outright.
+        gb_disp = gb * (gb_up_eff * up + gb_dn_eff * dn) * (0.5 if reset else 1.0)
         sh = sigma1 * math.sqrt(h) / math.sqrt(1.0 + h / P["h_sat"])
         # R10: horizon-linear fan scale (0 = v9 exactly)
         sh = sh * (1.0 + P.get("fan_h_lin", 0.0) * h / 240.0)
@@ -475,7 +351,7 @@ def forecast_market(prices, horizon, adj, P, rscale=1.0, fscale=1.0):
 
 
 # TRACK B: conditional z deltas by price level (x = last price), from v8-residual
-# z quantiles pooled over 6 practice cases (see /tmp/b_eda2.py sec C/D).
+# z quantiles pooled over 6 practice cases.
 # LOCO-stable signals: lo markets q25 = 0.00 in EVERY fold & horizon (they
 # essentially never move down: floor + no trading), q05 ~-0.4 vs pooled ~-1.5;
 # mid markets q25 ~-0.53 vs pooled ~-0.4; hi markets q05 ~-0.55 vs pooled ~-1.5.
@@ -556,11 +432,10 @@ def _d1_at(h, P):
     return bs[-1]
 
 
-def _apply_d1(out, case, P, rscale):
-    """Round-8 Track A: shift every quantile row by B(h)*d1*g (see docstring).
-    Applied AFTER the deadband, so the verified score is the post-deadband
-    shift. g = clip(d1_gate_k*(rscale-1),0,1): calm regimes (rscale<=1)
-    get g=0 and are bit-identical to v7."""
+def _apply_d1(out, case, P, rscale, skip_ids=None):
+    """Round-8 Track A: shift every quantile row by B(h)*d1*g.
+    Applied AFTER the deadband. g = clip(d1_gate_k*(rscale-1),0,1):
+    calm regimes (rscale<=1) get g=0 and are bit-identical to v7."""
     if not P.get("d1_on", 0):
         return out
     g = min(1.0, max(0.0, P.get("d1_gate_k", 2.0) * (rscale - 1.0)))
@@ -580,7 +455,7 @@ def _apply_d1(out, case, P, rscale):
             continue
         nr = []
         for h, row in enumerate(rows, start=1):
-            delta = scale * _d1_at(h, P) * d1 * g
+            delta = scale * _d1_at(h, P) * d1 * g * (0.5 if (skip_ids and m["id"] in skip_ids) else 1.0)
             if delta == 0.0:
                 nr.append(row)
                 continue
@@ -593,7 +468,7 @@ def _apply_d1(out, case, P, rscale):
     return new
 
 
-def _apply_gmom(out, case, P, rscale):
+def _apply_gmom(out, case, P, rscale, skip_ids=None):
     """Round-8 Track D: regime-gated down-momentum, applied AFTER the
     deadband (and after d1 when combined). Shifts every quantile by the
     same displacement, then re-clips/re-sorts."""
@@ -621,7 +496,7 @@ def _apply_gmom(out, case, P, rscale):
         nr = []
         for hi, row in enumerate(rows):
             h = hi + 1
-            d = g * gk * r30 * (1.0 - math.exp(-h / tau))
+            d = g * gk * r30 * (1.0 - math.exp(-h / tau)) * (0.5 if (skip_ids and m["id"] in skip_ids) else 1.0)
             r2 = [price6(v + d) for v in row]
             for j in range(1, 5):
                 if r2[j] < r2[j - 1]:
@@ -670,10 +545,31 @@ def _apply_stale_inner(out, case, P):
     return new
 
 
+def _apply_logic_proj(out, case):
+    """FAA logical projection (F4): Iran is a subset of foreign actor by
+    the market resolution rules, so every Iran quantile must be <= the
+    matching Foreign-actor quantile: q_Iran[h][j] = min(q_Iran[h][j],
+    q_Foreign[h][j]). Applied last, after all other post-processing.
+    No-op when either market is absent from the case (e.g. all NVIDIA
+    practice cases). Min of two non-decreasing rows stays non-decreasing;
+    rows are re-enforced anyway."""
+    if IRAN_ID not in out or FOREIGN_ID not in out:
+        return out
+    new = dict(out)
+    qi = out[IRAN_ID]
+    qf = out[FOREIGN_ID]
+    nr = []
+    for ri, rf in zip(qi, qf):
+        r2 = [min(a, b) for a, b in zip(ri, rf)]
+        for j in range(1, 5):
+            if r2[j] < r2[j - 1]:
+                r2[j] = r2[j - 1]
+        nr.append(r2)
+    new[IRAN_ID] = nr
+    return new
 
 # V9 TRACK D: per-x-bucket empirical z of (y - med_v8)/sh, all 6 practice
 # cases, h-centres 8/38/90/180/240, windows +-7 (h=8) / +-25 (else).
-# See header: the residual shape depends on the last price x.
 ZTABLE_X = {
     "x<.005": [
         (8, [-0.2883, 0.0000, 0.0000, 0.0000, 1.7649]),
@@ -773,7 +669,6 @@ def _apply_xfan(out, case, P, fscale):
     return new
 
 
-
 def forecast_case(case, P=PARAMS):
     """Full forecast for one parsed case dict: {id: rows}."""
     horizon = case["horizon_minutes"]
@@ -787,6 +682,23 @@ def forecast_case(case, P=PARAMS):
         xs.append(pr[-1] if pr else 0.5)
         sigs.append(_sigma_capped(pr, P) if pr else 0.0)
     board_sum = sum(xs)
+    # R7 DELTA: board-gated pull. The board-sum pull is only valid when the
+    # board is a partition (prices sum to ~1). NVIDIA practice boards
+    # (19-24 markets, sum 0.81-1.09) are partitions; FAA boards (2-4
+    # overlapping markets, sum 0.22-0.30) are not. Pull is ON only when
+    # n_markets >= 10 AND board_sum > 0.5; otherwise it is fully OFF.
+    # This is the structural version of top-10 #8's "board terms gated to
+    # broad boards" idea — the gate keys on board SHAPE, never on the
+    # competition name, so it also stays OFF on the 12 final FAA cases
+    # (4 markets each).
+    global _LAST_BOARD_GATE
+    _LAST_BOARD_GATE = 1.0 if (len(markets) >= 10 and board_sum > 0.5) else 0.0
+    # Local PARAMS copy with pull_max restored to the V10 value when the
+    # gate is ON, 0.0 when OFF. P is only reassigned locally (the global
+    # PARAMS dict is never mutated). pull_max is read solely inside
+    # forecast_market, so this affects only the pull.
+    P = dict(P)
+    P["pull_max"] = V10_PULL_MAX * _LAST_BOARD_GATE
     if board_sum <= 0.0:
         board_sum = 1.0
     # regime scaling (round 4): V = the board's mean per-minute sigma at the
@@ -911,9 +823,16 @@ def forecast_case(case, P=PARAMS):
             if abs(s_post) > 1e-12:
                 f = s_pre / s_post
                 adjs = [a * f for a in adjs]
+    # H5 DELTA: per-market news-reset flags, computed once per checkpoint.
+    reset_ids = {m["id"] for m in markets
+                 if P.get("news_reset") and _news_reset_active(m["prices"])}
     for mi, m in enumerate(markets):
-        out[m["id"]] = forecast_market(m["prices"], horizon, adjs[mi], P, rscale, fscale)
-    return _apply_stale_inner(_apply_xfan(_apply_gmom(_apply_d1(_apply_deadband(out, case, P), case, P, rscale), case, P, rscale), case, P, fscale), case, P)
+        rst = m["id"] in reset_ids
+        out[m["id"]] = forecast_market(m["prices"], horizon, adjs[mi], P, rscale, fscale, rst)
+    # F4 DELTA: logical projection Iran <= Foreign, applied last.
+    return _apply_logic_proj(
+        _apply_stale_inner(_apply_xfan(_apply_gmom(_apply_d1(_apply_deadband(out, case, P), case, P, rscale, reset_ids), case, P, rscale, reset_ids), case, P, fscale), case, P),
+        case)
 
 
 def main():
@@ -927,6 +846,7 @@ def main():
         with open(os.path.join(in_dir, fname), "r", encoding="utf-8") as f:
             case = json.load(f)
         fc = forecast_case(case)
+        print(f"GATE {cid} board_gate={int(_LAST_BOARD_GATE)}", file=sys.stderr)
         forecasts = [{"id": mid, "q": rows}
                      for mid, rows in fc.items()]
         with open(os.path.join(out_dir, cid + ".out"), "w", encoding="utf-8") as f:
